@@ -3,7 +3,10 @@ name = "xget"
 main = "src/index.js"
 compatibility_date = "2024-10-22"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = false
+workers_dev = true
+# 如需绑定自定义域名，请改回 false 并配置 routes：
+# routes = ["xget.example.com/*"]
+# zone_id = "<你的Zone ID>"
 [observability]
 enabled = true
 head_sampling_rate = 1
