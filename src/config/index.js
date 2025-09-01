@@ -5,6 +5,7 @@ import { PLATFORMS } from './platforms.js';
  * @property {string[]} ALLOWED_METHODS - List of allowed HTTP methods
  * @property {string[]} ALLOWED_ORIGINS - List of allowed CORS origins
  * @property {number} MAX_PATH_LENGTH - Maximum allowed URL path length
+ * @property {string|null} SECRET_TOKEN - API secret token for authentication
  */
 
 /**
@@ -31,7 +32,8 @@ export function createConfig(env = {}) {
     SECURITY: {
       ALLOWED_METHODS: env.ALLOWED_METHODS ? env.ALLOWED_METHODS.split(',') : ['GET', 'HEAD'],
       ALLOWED_ORIGINS: env.ALLOWED_ORIGINS ? env.ALLOWED_ORIGINS.split(',') : ['*'],
-      MAX_PATH_LENGTH: parseInt(env.MAX_PATH_LENGTH) || 2048
+      MAX_PATH_LENGTH: parseInt(env.MAX_PATH_LENGTH) || 2048,
+      SECRET_TOKEN: env.SECRET_TOKEN || null
     },
     PLATFORMS
   };

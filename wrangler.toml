@@ -3,10 +3,14 @@ name = "xget"
 main = "src/index.js"
 compatibility_date = "2024-10-22"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = true
-# 如需绑定自定义域名，请改回 false 并配置 routes：
-# routes = ["xget.example.com/*"]
-# zone_id = "<你的Zone ID>"
+workers_dev = false
+routes = ["xget.tecdao.com/*"]
+zone_id = "daf96c17616b36d757c0ee51849e1ab8"
+
+# 环境变量配置
+[vars]
+SECRET_TOKEN = "xqc2378217sdfaw38127"
+ALLOWED_ORIGINS = "https://xget.tecdao.com"
 [observability]
 enabled = true
 head_sampling_rate = 1

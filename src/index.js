@@ -146,6 +146,44 @@ function isAIInferenceRequest(request, url) {
 }
 
 /**
+ * Validates API token if security is enabled
+ * @param {Request} request - The incoming request object
+ * @param {import('./config/index.js').ApplicationConfig} config - Configuration object
+ * @returns {{valid: boolean, error?: string, status?: number}} Token validation result
+ */
+function validateToken(request, config = CONFIG) {
+  if (!config.SECURITY.SECRET_TOKEN) {
+    // If no secret token is configured, allow access
+    return { valid: true };
+  }
+
+  const authHeader = request.headers.get('Authorization');
+  const customToken = request.headers.get('X-Xget-Api-Key');
+
+  // Check Bearer token
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    if (token === config.SECURITY.SECRET_TOKEN) {
+      return { valid: true };
+    }
+  }
+
+  // Check custom header
+  if (customToken) {
+    if (customToken === config.SECURITY.SECRET_TOKEN) {
+      return { valid: true };
+    }
+  }
+
+  // Check query parameter for GET requests
+  if (request.method === 'GET' && new URL(request.url).searchParams.get('api_key') === config.SECURITY.SECRET_TOKEN) {
+    return { valid: true };
+  }
+
+  return { valid: false, error: 'Invalid API key', status: 401 };
+}
+
+/**
  * Validates incoming requests against security rules
  * @param {Request} request - The incoming request object
  * @param {URL} url - Parsed URL object
@@ -153,6 +191,12 @@ function isAIInferenceRequest(request, url) {
  * @returns {{valid: boolean, error?: string, status?: number}} Validation result
  */
 function validateRequest(request, url, config = CONFIG) {
+  // Validate API token first
+  const tokenValidation = validateToken(request, config);
+  if (!tokenValidation.valid) {
+    return tokenValidation;
+  }
+
   // Allow POST method for Git, Docker, and AI inference operations
   const isGit = isGitRequest(request, url);
   const isDocker = isDockerRequest(request, url);
@@ -179,9 +223,11 @@ function validateRequest(request, url, config = CONFIG) {
  * @param {string} message - Error message
  * @param {number} status - HTTP status code
  * @param {boolean} includeDetails - Whether to include detailed error information
+ * @param {Request} request - The incoming request object
+ * @param {import('./config/index.js').ApplicationConfig} config - Configuration object
  * @returns {Response} Error response
  */
-function createErrorResponse(message, status, includeDetails = false) {
+function createErrorResponse(message, status, includeDetails = false, request, config = CONFIG) {
   const errorBody = includeDetails
     ? JSON.stringify({ error: message, status, timestamp: new Date().toISOString() })
     : message;
@@ -191,23 +237,72 @@ function createErrorResponse(message, status, includeDetails = false) {
     headers: addSecurityHeaders(
       new Headers({
         'Content-Type': includeDetails ? 'application/json' : 'text/plain'
-      })
+      }),
+      request,
+      config
     )
   });
 }
 
 /**
+ * Adds CORS headers based on configuration
+ * @param {Headers} headers - Headers object to modify
+ * @param {Request} request - The incoming request object
+ * @param {import('./config/index.js').ApplicationConfig} config - Configuration object
+ * @returns {Headers} Modified headers object with CORS headers
+ */
+function addCorsHeaders(headers, request, config = CONFIG) {
+  const origin = request.headers.get('Origin');
+  const allowedOrigins = config.SECURITY.ALLOWED_ORIGINS;
+
+  if (allowedOrigins.includes('*')) {
+    headers.set('Access-Control-Allow-Origin', '*');
+  } else if (origin && allowedOrigins.includes(origin)) {
+    headers.set('Access-Control-Allow-Origin', origin);
+  } else if (origin) {
+    headers.set('Access-Control-Allow-Origin', 'null'); // Not allowed origin
+  }
+
+  headers.set('Access-Control-Allow-Methods', config.SECURITY.ALLOWED_METHODS.join(', '));
+  headers.set('Access-Control-Allow-Headers', 'Authorization, X-Xget-Api-Key, Content-Type');
+  headers.set('Access-Control-Max-Age', '86400'); // 24 hours
+
+  return headers;
+}
+
+/**
+ * Handles CORS preflight requests
+ * @param {Request} request - The incoming request object
+ * @param {import('./config/index.js').ApplicationConfig} config - Configuration object
+ * @returns {Response|null} Preflight response or null if not applicable
+ */
+function handleCorsPreflight(request, config = CONFIG) {
+  if (request.method === 'OPTIONS') {
+    const response = new Response(null, { status: 200, headers: new Headers() });
+    addCorsHeaders(response.headers, request, config);
+    return response;
+  }
+  return null;
+}
+
+/**
  * Adds security headers to the response
  * @param {Headers} headers - Headers object to modify
+ * @param {Request} request - The incoming request object for CORS
+ * @param {import('./config/index.js').ApplicationConfig} config - Configuration object
  * @returns {Headers} Modified headers object
  */
-function addSecurityHeaders(headers) {
+function addSecurityHeaders(headers, request, config = CONFIG) {
   headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
   headers.set('X-Frame-Options', 'DENY');
   headers.set('X-XSS-Protection', '1; mode=block');
   headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
-  headers.set('Content-Security-Policy', "default-src 'none'; img-src 'self'; script-src 'none'");
+  // 仅当未显式设置 CSP 时，才应用默认 CSP，避免覆盖需要内联样式的 HTML 页
+  if (!headers.has('Content-Security-Policy')) {
+    headers.set('Content-Security-Policy', "default-src 'none'; img-src 'self'; script-src 'none'");
+  }
   headers.set('Permissions-Policy', 'interest-cohort=()');
+  addCorsHeaders(headers, request, config);
   return headers;
 }
 
@@ -279,6 +374,12 @@ async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const isDocker = isDockerRequest(request, url);
 
+    // Handle CORS preflight requests
+    const corsResponse = handleCorsPreflight(request, config);
+    if (corsResponse) {
+      return corsResponse;
+    }
+
     const monitor = new PerformanceMonitor();
 
     // Handle Docker API version check
@@ -287,19 +388,224 @@ async function handleRequest(request, env, ctx) {
         'Docker-Distribution-Api-Version': 'registry/2.0',
         'Content-Type': 'application/json'
       });
-      addSecurityHeaders(headers);
+      addSecurityHeaders(headers, request, config);
       return new Response('{}', { status: 200, headers });
     }
 
-    // Redirect root path or invalid platforms to GitHub repository
-    if (url.pathname === '/' || url.pathname === '') {
-      const HOME_PAGE_URL = 'https://github.com/xixu-me/Xget';
-      return Response.redirect(HOME_PAGE_URL, 302);
+    // Workers 内置根路径介绍页与健康检查
+    // 1) 健康检查端点（Workers 原生版本）
+    if (url.pathname === '/health' || url.pathname === '/api/health') {
+      const info = {
+        service: 'Xget',
+        version: '1.0.0',
+        platform: 'Cloudflare Workers',
+        status: 'OK',
+        timestamp: new Date().toISOString(),
+        region: (request.cf && request.cf.colo) || 'N/A',
+        endpoints: {
+          health: '/health',
+          root: '/',
+          proxy: '/{platform}/{path}'
+        }
+      };
+      return new Response(JSON.stringify(info, null, 2), {
+        status: 200,
+        headers: addSecurityHeaders(
+          new Headers({
+            'Content-Type': 'application/json',
+            'Cache-Control': 'public, max-age=60',
+            'X-Service': 'Xget-Workers'
+          }),
+          request,
+          config
+        )
+      });
     }
+
+    // 2) 内置 URL 转换器功能页：/convert
+    if (url.pathname === '/convert') {
+      const originalUrl = url.searchParams.get('url')?.trim();
+
+      // 将原始 URL 转换为 Xget 路径
+      function tryConvert(u) {
+        try {
+          const parsed = new URL(u);
+
+          // 1) 特例：raw.githubusercontent.com 映射为 gh/raw 路径
+          if (parsed.hostname === 'raw.githubusercontent.com') {
+            // 格式：/owner/repo/branch/path -> /gh/owner/repo/raw/branch/path
+            const parts = parsed.pathname.split('/').filter(Boolean);
+            if (parts.length >= 3) {
+              const [owner, repo, branch, ...rest] = parts;
+              const restPath = rest.length ? `/${rest.join('/')}` : '';
+              const xgetPath = `/gh/${owner}/${repo}/raw/${branch}${restPath}${parsed.search}`;
+              return { platformKey: 'gh', xgetPath };
+            }
+          }
+
+          // 2) 基于 PLATFORMS 的最长前缀匹配（含子路径）
+          const platformEntries = Object.entries(CONFIG.PLATFORMS)
+            .map(([key, base]) => ({ key, base }))
+            // 优先匹配更“长”的 base（含路径的更具体）
+            .sort((a, b) => b.base.length - a.base.length);
+
+          for (const { key, base } of platformEntries) {
+            try {
+              const baseUrl = new URL(base);
+              if (parsed.hostname !== baseUrl.hostname) continue;
+
+              // 处理 baseUrl.path 前缀（如 https://github.com/Homebrew）
+              const basePath = baseUrl.pathname.endsWith('/')
+                ? baseUrl.pathname.slice(0, -1)
+                : baseUrl.pathname;
+              const inputPath = parsed.pathname;
+
+              if (!inputPath.startsWith(basePath)) continue;
+
+              // 去掉基路径，保留余下路径
+              let restPath = inputPath.slice(basePath.length);
+              if (!restPath.startsWith('/')) restPath = '/' + restPath;
+
+              // 平台前缀：将 - 替换为 /
+              const prefix = `/${key.replace(/-/g, '/')}`;
+
+              // 容器注册表平台使用 /cr/ 前缀
+              const xgetPath = key.startsWith('cr-')
+                ? `/cr/${key.split('-')[1]}${restPath}${parsed.search}`
+                : `${prefix}${restPath}${parsed.search}`;
+
+              return { platformKey: key, xgetPath };
+            } catch (_) {
+              // base 不是合法 URL 的情况忽略
+            }
+          }
+
+          // 3) 常见主机别名兜底（如 github.com -> gh）
+          if (parsed.hostname === 'github.com') {
+            return { platformKey: 'gh', xgetPath: `/gh${parsed.pathname}${parsed.search}` };
+          }
+          if (parsed.hostname === 'pypi.org') {
+            return { platformKey: 'pypi', xgetPath: `/pypi${parsed.pathname}${parsed.search}` };
+          }
+          if (parsed.hostname === 'files.pythonhosted.org') {
+            return { platformKey: 'pypi-files', xgetPath: `/pypi/files${parsed.pathname}${parsed.search}` };
+          }
+          if (parsed.hostname === 'registry.npmjs.org') {
+            return { platformKey: 'npm', xgetPath: `/npm${parsed.pathname}${parsed.search}` };
+          }
+          if (parsed.hostname === 'ghcr.io') {
+            return { platformKey: 'cr-ghcr', xgetPath: `/cr/ghcr${parsed.pathname}${parsed.search}` };
+          }
+          if (parsed.hostname === 'quay.io') {
+            return { platformKey: 'cr-quay', xgetPath: `/cr/quay${parsed.pathname}${parsed.search}` };
+          }
+
+          return { error: '未识别的源站，当前转换器暂不支持该 URL' };
+        } catch (e) {
+          return { error: 'URL 格式不正确，请输入完整的 http(s) URL' };
+        }
+      }
+
+      const branding = `<p class="note"><strong>预部署实例（不保证可靠性）：</strong><a href="https://xget.xi-xu.me" target="_blank" rel="noopener">xget.xi-xu.me</a> - 开箱即用，无需部署！</p>`;
+
+      if (!originalUrl) {
+        const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'self'"><title>Xget - URL 转换器</title><style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, 'Microsoft Yahei', sans-serif; margin: 2rem; line-height: 1.6; color: #111; }
+    code { background: #f6f8fa; padding: 0.15rem 0.35rem; border-radius: 4px; }
+    input,button { font-size: 16px; }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .note { background: #fff8c5; border: 1px solid #ffd33d; padding: 0.75rem 1rem; border-radius: 6px; }
+    form { display:flex; gap:.5rem; max-width:720px; }
+    input[type=url] { flex:1; padding:.5rem .75rem; border:1px solid #ccc; border-radius:6px; }
+    button { padding:.5rem .9rem; border:0; border-radius:6px; background:#0969da; color:#fff; cursor:pointer; }
+  </style></head><body>
+  <h1>🔗 Xget URL 转换器</h1>
+  ${branding}
+  <p style="font-weight:600;color:#0f5132;background:#d1e7dd;border:1px solid #badbcc;padding:.75rem 1rem;border-radius:6px;">⚡ 立即体验极速下载：无需注册，无需配置，直接使用即可感受飞一般的下载速度！</p>
+  <form action="/convert" method="GET" style="margin:1rem 0;display:flex;gap:.5rem;max-width:720px;">
+    <input type="url" name="url" placeholder="在此粘贴原始 URL（例如 https://github.com/... 或 https://registry.npmjs.org/...）" style="flex:1;padding:.5rem .75rem;border:1px solid #ccc;border-radius:6px;" required />
+    <button type="submit" style="padding:.5rem .9rem;border:0;border-radius:6px;background:#0969da;color:#fff;cursor:pointer;">转换</button>
+  </form>
+  <p>支持来源：GitHub、GitLab、Hugging Face、npm、PyPI、conda、Maven、Homebrew、容器注册表（ghcr、quay、gcr、mcr 等）及更多。只需粘贴原始 URL，自动生成 Xget 加速链接。</p>
+</body>
+</html>`;
+        return new Response(html, {
+          status: 200,
+          headers: addSecurityHeaders(
+            new Headers({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }),
+            request,
+            config
+          )
+        });
+      }
+
+      const result = tryConvert(originalUrl);
+      const instanceOrigin = url.origin;
+
+      // 构建结果区块，避免在模板字符串内嵌套模板字符串导致语法歧义
+      let resultSection = '';
+      if (result.error) {
+        const safeErr = String(result.error).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+        resultSection = '<p style="color:#842029;background:#f8d7da;border:1px solid #f5c2c7;padding:.75rem 1rem;border-radius:6px;">' + safeErr + '</p>';
+      } else {
+        const safePath = String(result.xgetPath || '');
+        resultSection = (
+          '<h2>转换成功</h2>' +
+          '<p>当前实例链接：</p>' +
+          '<pre><code>' + instanceOrigin + safePath + '</code></pre>' +
+          '<p>预部署实例链接：</p>' +
+          '<pre><code>https://xget.xi-xu.me' + safePath + '</code></pre>' +
+          '<p>' +
+          '<a href="' + safePath + '" style="margin-right:1rem;">在当前实例中打开</a>' +
+          '<a href="https://xget.xi-xu.me' + safePath + '" target="_blank" rel="noopener">在预部署实例中打开</a>' +
+          '</p>'
+        );
+      }
+
+      const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" /><title>Xget - URL 转换结果</title><style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, 'Microsoft Yahei', sans-serif; margin: 2rem; line-height: 1.6; color: #111; }
+    code { background: #f6f8fa; padding: 0.15rem 0.35rem; border-radius: 4px; }
+    input,button { font-size: 16px; }
+    a { color: #0969da; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    pre { background: #f6f8fa; padding: 1rem; border-radius: 6px; overflow: auto; }
+    .note { background: #fff8c5; border: 1px solid #ffd33d; padding: 0.75rem 1rem; border-radius: 6px; }
+  </style></head><body>
+  <h1>🔗 Xget URL 转换结果</h1>
+  ${branding}
+  <form action="/convert" method="GET" style="margin:1rem 0;display:flex;gap:.5rem;max-width:720px;">
+    <input type="url" name="url" value="${originalUrl.replace(/"/g, '&quot;')}" style="flex:1;padding:.5rem .75rem;border:1px solid #ccc;border-radius:6px;" required />
+    <button type="submit" style="padding:.5rem .9rem;border:0;border-radius:6px;background:#0969da;color:#fff;cursor:pointer;">重新转换</button>
+  </form>
+  ${resultSection}
+</body>
+</html>`;
+
+      return new Response(html, {
+        status: 200,
+        headers: addSecurityHeaders(
+          new Headers({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+        )
+      });
+    }
+
+    // 3) 根路径直接跳转到 /convert 功能页（透传查询参数）
+    if (url.pathname === '/' || url.pathname === '') {
+      const dest = new URL(url.toString());
+      dest.pathname = '/convert';
+      // 保留原始查询参数，便于直接传入 url=xxx
+      const headers = addSecurityHeaders(new Headers({ Location: dest.toString() }), request, config);
+      return new Response(null, { status: 302, headers });
+    }
+
+    // 4) 根路径说明页（如需改回说明页，可恢复此段）
+    // 注：当前我们选择方案 A，直接跳转到 /convert，因此说明页逻辑被替换为 302 重定向。
+
 
     const validation = validateRequest(request, url, config);
     if (!validation.valid) {
-      return createErrorResponse(validation.error || 'Validation failed', validation.status || 400);
+      return createErrorResponse(validation.error || 'Validation failed', validation.status || 400, false, request, config);
     }
 
     // Parse platform and path
@@ -315,6 +621,8 @@ async function handleRequest(request, env, ctx) {
       }
       // Remove /v2 from the path for container registry API consistency if present
       effectivePath = url.pathname.replace(/^\/v2/, '');
+    } else if (isDocker && !url.pathname.startsWith('/cr/') && !url.pathname.startsWith('/v2/cr/')) {
+      return createErrorResponse('container registry requests must use /cr/ prefix', 400, false, request, config);
     }
 
     // Platform detection using transform patterns
@@ -606,14 +914,16 @@ async function handleRequest(request, env, ctx) {
       } catch (error) {
         attempts++;
         if (error instanceof Error && error.name === 'AbortError') {
-          return createErrorResponse('Request timeout', 408);
+          return createErrorResponse('Request timeout', 408, false, request, config);
         }
         if (attempts >= config.MAX_RETRIES) {
           const message = error instanceof Error ? error.message : String(error);
           return createErrorResponse(
             `Failed after ${config.MAX_RETRIES} attempts: ${message}`,
             500,
-            true
+            true,
+            request,
+            config
           );
         }
         // Wait before retrying
@@ -623,27 +933,31 @@ async function handleRequest(request, env, ctx) {
 
     // Check if we have a valid response after all attempts
     if (!response) {
-      return createErrorResponse('No response received after all retry attempts', 500, true);
+      return createErrorResponse('No response received after all retry attempts', 500, true, request, config);
     }
 
     // If response is still not ok after all retries, return the error
     if (!response.ok && response.status !== 206) {
-      // For Docker authentication errors that we couldn't resolve with anonymous tokens,
-      // return a more helpful error message
+      // 对 Docker 的 401 做专门处理；其余情况尽量透传上游响应，避免把 HTML/纯文本错误页改造成 JSON
       if (isDocker && response.status === 401) {
         const errorText = await response.text().catch(() => '');
         return createErrorResponse(
           `Authentication required for this container registry resource. This may be a private repository. Original error: ${errorText}`,
           401,
-          true
+          true,
+          request,
+          config
         );
       }
-      const errorText = await response.text().catch(() => 'Unknown error');
-      return createErrorResponse(
-        `Upstream server error (${response.status}): ${errorText}`,
-        response.status,
-        true
-      );
+
+      // Git/GitHub 等网页类响应或 4xx/5xx，优先透传上游内容与 Content-Type
+      const ct = response.headers.get('content-type') || '';
+      if (isGit || ct.includes('text/html') || ct.includes('text/plain')) {
+        return response;
+      }
+
+      // 其他类型的错误（如 JSON API），保留原信息，但不强制改为 JSON 包装
+      return response;
     }
 
     // Handle URL rewriting for different platforms
@@ -724,7 +1038,7 @@ async function handleRequest(request, env, ctx) {
   } catch (error) {
     console.error('Error handling request:', error);
     const message = error instanceof Error ? error.message : String(error);
-    return createErrorResponse(`Internal Server Error: ${message}`, 500, true);
+    return createErrorResponse(`Internal Server Error: ${message}`, 500, true, request, CONFIG);
   }
 }
 
